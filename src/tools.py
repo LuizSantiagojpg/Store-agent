@@ -12,6 +12,7 @@ Implements 5 grounded tools backed by SQLite and the indexed Store Policy Manual
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,64 @@ ACCESSORY_KEYWORDS = [
     "amplificadores", "amp", "cubo", "suporte", "estalante", "correia", "capotraste",
     "boquilha", "boquilhas", "baqueta", "baquetas", "afinador avulso"
 ]
+
+
+def _coerce_str(val: Any) -> Optional[str]:
+    """Normalize optional string arguments from LLM tool calls, ignoring empty/null placeholders."""
+    if val is None or isinstance(val, bool):
+        return None
+    s = str(val).strip()
+    if s.lower() in ("", "none", "null", "nil", "n/a", "all", "any", "todos", "todas", "qualquer", "false"):
+        return None
+    return s
+
+
+def _coerce_float(val: Any) -> Optional[float]:
+    """Coerce numeric or stringified price arguments (e.g. '1000', 'R$ 1.000,00') to float."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if float(val) > 0 else None
+    s = str(val).strip().lower()
+    if s in ("", "none", "null", "0", "0.0", "false", "n/a", "inf", "infinity"):
+        return None
+    s = re.sub(r"[r\$\s]", "", s)
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        num = float(s)
+        return num if num > 0 else None
+    except ValueError:
+        return None
+
+
+def _coerce_int(val: Any) -> Optional[int]:
+    """Coerce integer or stringified IDs (e.g. '8', '#8') to int."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val > 0 else None
+    s = str(val).strip().lower()
+    if s in ("", "none", "null", "0", "false", "n/a"):
+        return None
+    m = re.search(r"\d+", s)
+    return int(m.group(0)) if m and int(m.group(0)) > 0 else None
+
+
+def _coerce_bool(val: Any) -> Optional[bool]:
+    """Coerce boolean or stringified boolean ('True', 'False', '0', '1') from local LLM tool calls."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "sim"):
+        return True
+    if s in ("false", "0", "no", "nao", "não", "", "none", "null"):
+        return False
+    return None
 
 
 def _compute_installments(amount_brl: float) -> Dict[str, Any]:
@@ -168,8 +227,31 @@ class EmporioTools:
             has_electronics: Optional filter for electroacoustic/pickup instruments (True/False).
             only_active_promotions: If True, returns only products with currently active promotions (is_active=1).
         """
+        query = _coerce_str(query)
+        category = _coerce_str(category)
+        max_price = _coerce_float(max_price)
+        min_price = _coerce_float(min_price)
+        strings_type = _coerce_str(strings_type)
+        has_electronics = _coerce_bool(has_electronics)
+        only_active_promotions = bool(_coerce_bool(only_active_promotions))
+
         q_norm = normalize_text(query or "")
         cat_norm = normalize_text(category or "")
+
+        # Auto-infer category from query if category was not explicitly provided
+        alias_map = {
+            "violao": [5], "violoes": [5],
+            "guitarra": [1], "guitarras": [1],
+            "baixo": [2], "baixos": [2], "contrabaixo": [2],
+            "bateria": [3], "baterias": [3], "percussao": [3],
+            "teclado": [4], "teclados": [4], "piano": [4], "sintetizador": [4],
+            "ukulele": [9], "ukuleles": [9],
+        }
+        if not cat_norm and q_norm:
+            for k in alias_map:
+                if k in q_norm.split():
+                    cat_norm = k
+                    break
 
         # Check if customer is asking for out-of-scope accessories (Policy 1 & 7.1)
         out_of_scope_alert = None
@@ -181,10 +263,10 @@ class EmporioTools:
                 ):
                     continue
                 out_of_scope_alert = (
-                    "ATENÇÃO (Política 1 e 7.1): A Empório da Música trabalha EXCLUSIVAMENTE com "
-                    "instrumentos musicais. Não comercializamos acessórios avulsos (cordas, palhetas, "
-                    "cabos, cases, pedais, amplificadores ou boquilhas). Redirecione o cliente "
-                    "educadamente informando nosso escopo exclusivo de instrumentos."
+                    "Política de Escopo (Seções 1 e 7.1): A Empório da Música trabalha EXCLUSIVAMENTE com "
+                    "instrumentos musicais (violões, guitarras, baixos, baterias, teclados e ukuleles). "
+                    "Nós não comercializamos acessórios avulsos como cordas, encordoamentos, palhetas, "
+                    "cabos, cases/capas, pedais, amplificadores ou boquilhas."
                 )
                 break
 
@@ -215,14 +297,6 @@ class EmporioTools:
             ]
             # Handle singular/plural aliases
             if not cat_matches:
-                alias_map = {
-                    "violao": [5], "violoes": [5],
-                    "guitarra": [1], "guitarras": [1],
-                    "baixo": [2], "baixos": [2], "contrabaixo": [2],
-                    "bateria": [3], "baterias": [3], "percussao": [3],
-                    "teclado": [4], "teclados": [4], "piano": [4], "sintetizador": [4],
-                    "ukulele": [9], "ukuleles": [9],
-                }
                 for k, v in alias_map.items():
                     if k in cat_norm:
                         cat_matches.extend(v)
@@ -232,6 +306,16 @@ class EmporioTools:
         available_results: List[Dict[str, Any]] = []
         unavailable_results: List[Dict[str, Any]] = []
 
+        generic_stopwords = {
+            "de", "da", "do", "das", "dos", "em", "na", "no", "com", "para", "por", "ate",
+            "disponivel", "disponiveis", "opcao", "opcoes", "quero", "tem", "loja", "catalogo",
+            "estoque", "instrumento", "instrumentos", "modelo", "modelos", "custando", "reais",
+            "r$", "preco", "valor", "ate", "menos", "barato", "compra", "comprar", "promocao",
+            "ativa", "ativas", "desconto", "hoje",
+        }
+        if matched_cat_ids is not None:
+            generic_stopwords.update(alias_map.keys())
+
         for row in all_rows:
             if matched_cat_ids is not None and row["category_id"] not in matched_cat_ids:
                 continue
@@ -240,15 +324,13 @@ class EmporioTools:
 
             # Query text matching
             if q_norm:
-                # Ignore generic words that already map to categories
                 tokens = [
-                    t for t in q_norm.split()
-                    if t not in {"de", "da", "do", "com", "para", "ate", "disponiveis", "opcoes", "quero", "tem"}
+                    t for t in re.split(r"[\s,;:.!?/\\]+", q_norm)
+                    if t and t not in generic_stopwords and not t.isdigit()
                 ]
                 searchable = normalize_text(
                     f"{item['name']} {item['category_name']} {item['description']} {json.dumps(item['specs'])}"
                 )
-                # Synonym normalization (violao <-> violoes)
                 norm_tokens = []
                 for t in tokens:
                     if t == "violoes":
@@ -284,10 +366,10 @@ class EmporioTools:
                 if st_norm == "nylon" and prod_strings != "nylon" and "nylon" not in normalize_text(item["name"]):
                     continue
 
-            if has_electronics is not None:
+            if has_electronics is True:
                 elec_val = str(item["specs"].get("electronics", "")).lower()
                 is_elec = elec_val == "yes" or "eletrico" in normalize_text(item["name"])
-                if has_electronics != is_elec:
+                if not is_elec:
                     continue
 
             if only_active_promotions and not item["active_promotion"]:
@@ -395,6 +477,10 @@ class EmporioTools:
             customer_query: Customer name, email, or phone number.
             reference_date: Current reference date in YYYY-MM-DD format for calculating 7-day and 30-day windows.
         """
+        order_id = _coerce_int(order_id)
+        customer_query = _coerce_str(customer_query)
+        reference_date = _coerce_str(reference_date) or "2026-03-25"
+
         cur = self.conn.cursor()
         matched_orders: List[sqlite3.Row] = []
 
@@ -544,7 +630,10 @@ class EmporioTools:
             has_active_promotion: True if the price already includes an active store promotion (disables 5% PIX discount).
             is_large_instrument: True for acoustic drum kits, digital pianos, or double basses (Section 5.2).
         """
-        amount = float(amount_brl)
+        amount = _coerce_float(amount_brl) or 0.0
+        city = _coerce_str(city) or "Campo Grande"
+        has_active_promotion = bool(_coerce_bool(has_active_promotion))
+        is_large_instrument = bool(_coerce_bool(is_large_instrument))
         installments = _compute_installments(amount)
 
         if has_active_promotion:
@@ -605,6 +694,13 @@ class EmporioTools:
         tokens = [t for t in q_norm.split() if len(t) > 2]
 
         scored_sections = []
+        general_store_terms = {
+            "endereco", "localizacao", "onde", "fica", "rua", "campo grande",
+            "horario", "funcionamento", "aberto", "fechado", "expediente",
+            "telefone", "whatsapp", "contato", "email", "loja", "acessorio", "acessorios",
+        }
+        touches_general_info = any(term in q_norm for term in general_store_terms)
+
         for sec in STORE_POLICY_SECTIONS:
             score = 0
             sec_text_norm = normalize_text(sec["title"] + " " + sec["content"] + " " + " ".join(sec["keywords"]))
@@ -614,11 +710,13 @@ class EmporioTools:
             for tok in tokens:
                 if tok in sec_text_norm:
                     score += 1
+            if touches_general_info and sec["section_id"] in ("1", "2"):
+                score += 5
             if score > 0:
                 scored_sections.append((score, sec))
 
         scored_sections.sort(key=lambda x: x[0], reverse=True)
-        matched = [s[1] for s in scored_sections[:3]] if scored_sections else STORE_POLICY_SECTIONS[:4]
+        matched = [s[1] for s in scored_sections[:4]] if scored_sections else STORE_POLICY_SECTIONS[:4]
 
         return {
             "query": topic,

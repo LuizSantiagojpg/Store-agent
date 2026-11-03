@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.agent import EmporioAgent
 from src.tools import EmporioTools
 
 
@@ -80,6 +81,33 @@ class TestEmporioAgentAndTools(unittest.TestCase):
         res = self.tools.search_products(query="encordoamento e pedal de guitarra")
         self.assertIsNotNone(res["out_of_scope_accessory_alert"])
         self.assertIn("EXCLUSIVAMENTE com instrumentos musicais", res["out_of_scope_accessory_alert"])
+
+    def test_local_llm_stringified_tool_arguments_coercion(self) -> None:
+        """Ensure stringified arguments emitted by 8B local models (Llama 3.1) are properly coerced."""
+        res = self.tools.search_products(
+            category="Violões",
+            query="",
+            max_price="1000",  # type: ignore[arg-type]
+            min_price="0",  # type: ignore[arg-type]
+            has_electronics="False",  # type: ignore[arg-type]
+            only_active_promotions="False",  # type: ignore[arg-type]
+        )
+        self.assertEqual(res["total_available_in_stock"], 12)
+
+    def test_agent_end_to_end_and_session_persistence(self) -> None:
+        """Verify end-to-end EmporioAgent chat execution and persistent session history."""
+        agent = EmporioAgent(provider="local_deterministic")
+        session_id = "unit_test_session"
+        agent.memory.clear(session_id)
+
+        out = agent.chat("Quanto custa o Takamine GD20?", session_id=session_id)
+        self.assertIn("2,199.00", out["reply"])
+        self.assertEqual(len(out["tool_calls"]), 1)
+        self.assertEqual(out["tool_calls"][0]["tool"], "get_product_details")
+
+        history = agent.memory.get_history(session_id)
+        self.assertEqual(len(history), 2)
+        agent.memory.clear(session_id)
 
 
 if __name__ == "__main__":
